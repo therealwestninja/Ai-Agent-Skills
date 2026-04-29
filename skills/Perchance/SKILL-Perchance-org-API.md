@@ -2,18 +2,40 @@
 name: perchance-api
 description: >
   Use this skill whenever working with Perchance.org — building generators, AI chat apps, plugins,
-  or any JavaScript code that runs on perchance.org. Covers the Perchance DSL syntax, the ai-text-plugin
-  API, text-to-image plugin, character/thread/message data models, IndexedDB (Dexie.js) patterns,
-  hierarchical summarization, lorebooks, memory systems, streaming responses, sandboxed custom code,
-  share-link/upload patterns including the hash-share fallback for forked deployments,
-  upload-plugin domain-allowlist mitigation, the `expires`+`deletionUrl` upload options,
-  AI runtime sentinels for letting the AI drive scene/runtime side-effects, and natural-language
-  wizard skips. Trigger this skill for any mention of perchance, ai-text-plugin, perchance generator,
-  ai-character-chat, or building a Perchance-hosted AI app. Also trigger when the user shows code
-  that uses `root.aiTextPlugin`, `root.textToImagePlugin`, `root.uploadPlugin`, Perchance list syntax,
-  the `{import:...}` pattern, `[BG:type]` / `[VIZ:type]` / `[PAUSE n]` markers, or hash-share URLs
-  like `#cfg=` / `#persona=`. Trigger when seeing the upload error
-  "Forbidden: This API Key is locked to specific domains".
+  or any JavaScript code that runs on perchance.org. Covers the Perchance DSL syntax including
+  `$preprocess` for source transformation, `$output` for import-time list overriding, the full
+  list-property API (selectOne, selectMany, selectUnique, consumableList, evaluateItem, joinItems,
+  pluralForm, titleCase, getName, getParent, getChildNames, getPropertyNames, getFunctionNames,
+  getAllKeys, getRawListText, getOdds, getLength, createClone), the `this` keyword for modular
+  hierarchies, function syntax including async, if/else (long-form, JS-form, ternary), inline
+  lists `{a|b|c}` and `{1-100}`, static `^N` and dynamic `^[expr]` odds, comma-in-square-blocks
+  for hidden side-effects, page load order with the module-script `root.<list>` rule, runtime
+  globals (generatorName, generatorPublicId, generatorLastEditTime), `createPerchanceTree(text)`,
+  `window.ignorePerchanceErrors`/`clearPerchanceErrors`, and dynamic page-state mutation via
+  `document.title`/`window.location.hash`/`history.replaceState`. Covers the ai-text-plugin API,
+  text-to-image plugin, the Perchance HTTP API toolkit (getGeneratorScreenshot, getGeneratorList,
+  getGeneratorStats, downloadGenerator, getGeneratorsAndDependencies, generateList.php), the
+  DIY/self-hosted JSDOM pattern with `__cacheBust`, and the critical fact that **ai-text-plugin
+  and text-to-image-plugin are origin-locked to perchance.org and won't work on self-hosted forks
+  or downloaded HTML**. Covers secret-plugin for quantum-resistant client-side encryption,
+  text-editor-plugin-v1 for high-performance styled textareas with inline AI completion and Yjs
+  collaboration, character/thread/message data models, IndexedDB (Dexie.js) patterns, hierarchical
+  summarization, lorebooks, memory systems, streaming responses, sandboxed custom code,
+  share-link/upload patterns including the hash-share fallback for forked deployments, upload-plugin
+  domain-allowlist mitigation, the `expires`+`deletionUrl` upload options, embedding via
+  `null.perchance.org/<name>`, the download-button-plugin, offline-edit by appending `#edit` to
+  a downloaded HTML's URL, AI runtime sentinels for letting the AI drive scene/runtime side-effects,
+  and natural-language wizard skips. Trigger this skill for any mention of perchance, ai-text-plugin,
+  perchance generator, ai-character-chat, or building a Perchance-hosted AI app. Also trigger when
+  the user shows code that uses `root.aiTextPlugin`, `root.textToImagePlugin`, `root.uploadPlugin`,
+  `root.secret`, `superFetch`, `secret.generateKeyPair`, `createTextEditor`, `generateList.php`,
+  `getGeneratorList`, `$preprocess`, `$output`, `selectUnique`, `selectMany`, `consumableList`,
+  `evaluateItem`, `getParent`, `getName`, `createPerchanceTree`, `null.perchance.org`,
+  `__cacheBust`, JSDOM, Perchance list syntax, the `{import:...}` pattern, `[BG:type]` /
+  `[VIZ:type]` / `[PAUSE n]` markers, hash-share URLs like `#cfg=` / `#persona=`, or
+  `PUBLIC_…_PUBLIC_END` / `PRIVATE_…_PRIVATE_END` key envelopes. Trigger when seeing the upload
+  error "Forbidden: This API Key is locked to specific domains" or the complaint
+  "ai-text-plugin doesn't work on my server / fork / download".
 ---
 
 # Perchance API & AI Chat Skill
@@ -62,6 +84,17 @@ fullscreenButtonPlugin = {import:fullscreen-button-plugin}
 combineEmojis = {import:combine-emojis-plugin}
 bugReport = {import:bug-report-plugin}          // browser debug info for bug reports
 dynamicImport = {import:dynamic-import-plugin}  // lazy-load other generators at runtime
+secret = {import:secret-plugin}                  // quantum-resistant client-side encryption
+literal = {import:literal-plugin}                // allow [] / {} in user-supplied strings
+createTextEditor = {import:text-editor-plugin-v1} // higher-perf <textarea> with styling
+faviconPlugin = {import:favicon-plugin}          // dynamic favicon swap
+bugReportPlugin = {import:bug-report-plugin}     // alias used in some generators
+dice = {import:dice-plugin}                      // dice("1d6"), dice("2d6+3") notation
+downloadButton = {import:download-button-plugin} // adds a "download as HTML" button
+randomSelect = {import:random-select-plugin}     // pick which LIST (not item) to draw from
+createInstance = {import:create-instance-plugin} // template/instance pattern for entities
+makeTable = {import:make-table-plugin}           // build HTML tables from list data
+selectLeaf = {import:select-leaf-plugin}         // selectOne but always reaches a leaf node
 ```
 
 ### 1.4 `dynamicImport` — Lazy Loading External Generators
@@ -106,6 +139,259 @@ async dynamic(inputs) =>
   let fileName = urlNamedCharacters[inputs.urlParams.char];
   ...
 ```
+
+### 1.6 List Properties (selection, evaluation, introspection)
+
+Every list on Perchance has a small "API" of dotted properties. The selection ones are the workhorses:
+
+| Property | Behavior |
+|---|---|
+| `list.selectOne` | Single random item. Square blocks `[list]` apply this implicitly. |
+| `list.selectMany(n)` | Array of `n` items, **duplicates allowed**. |
+| `list.selectUnique(n)` | Array of `n` items, **never the same item twice**. |
+| `list.selectUnique(min, max)` | Random count between min and max, all unique. |
+| `list.consumableList` | Returns a *copy* of the list that removes items as they're chosen. Persists across multiple uses — set it once, then each `[cl]` consumes one. |
+| `list.joinItems(sep)` | Joins a `selectMany`/`selectUnique` array into a string. |
+| `list.evaluateItem` | Selects + fully evaluates inline lists (`{red\|pink}`) before returning. Use this when storing into a variable. |
+| `list.pluralForm` | Plural-form selection. Override per-item if Perchance's heuristic is wrong. |
+| `list.titleCase` | Title-cased selection. |
+
+Introspection / hierarchy:
+
+| Property | Returns |
+|---|---|
+| `list.getName` | The list's own name (the leaf identifier in the DSL). |
+| `list.getParent` | The parent list (walks up the hierarchy). |
+| `list.getChildNames` | Names of direct children. |
+| `list.getPropertyNames` | Names of property-style children (e.g. `height` in `person.height = …`). |
+| `list.getFunctionNames` | Names of function-style children. |
+| `list.getAllKeys` | Everything — children + properties + functions. |
+| `list.getRawListText` | The raw DSL source of the list (pre-evaluation). |
+| `list.getOdds` | The currently-effective odds value of an item (after dynamic-odds evaluation). |
+| `list.getLength` | Number of items in the list. |
+| `list.createClone` | A fresh copy you can mutate independently of the original. |
+
+Globals available inside any list/function:
+- `generatorName` — the URL slug (`perchance.org/<this>`)
+- `generatorPublicId` — the random-looking public ID
+- `generatorLastEditTime` — epoch ms of last save
+- `root` — the top of the Perchance tree (root of all lists)
+
+### 1.7 The `this` Keyword and `getParent` (Modular Hierarchies)
+
+Inside a list item, `this` refers to the **parent of the current item** (not a JS-style "self"). This lets you write self-contained, renameable hierarchies:
+
+```
+person
+  height = {100-200}
+  eyeColor = {brown^3|blue|grey^0.2|green^0.3}
+  description = The person is [this.height]cm tall with [this.eyeColor] eyes.
+```
+
+`description` doesn't reference `person` by name — rename `person → human` and nothing breaks. To climb further, chain `.getParent`:
+
+```
+cake
+  flavor = {strawberry|dark chocolate|vanilla}
+  description
+    A tasty [this.getParent.flavor] cake.
+```
+
+`.getName` is great for descriptive output without hardcoding labels:
+
+```
+animal
+  mammal
+    mouse
+      description = a [this.getName] is a type of [this.getParent.getName]
+```
+
+### 1.8 The `$output` Keyword (overriding what a list "is")
+
+By default, when you `{import:my-gen}` from another generator, the importer gets a random *top-level list name* (`"animal"`, `"adjective"`, ...). To make `{import:my-gen}` return something useful, define `$output`:
+
+```
+$output = [description]   // {import:my-gen} now returns a random description
+
+description
+  It's {a} [adjective] [thing] that looks {10-70} years old.
+adjective
+  ...
+thing
+  ...
+```
+
+`$output` also works *inside* a list to combine its multi-line items into a single string:
+
+```
+output
+  $output = [this.joinItems("")]
+  [d = dice.selectOne, n = name.selectOne, ""]
+  [if(name == "Sae") {d = d*2, ""} else {""}]
+  [name] attacked and dealt [d] damage.
+```
+
+The function form is `$output(text) => ...; return text;` — used by **preprocessors** (see 1.13).
+
+### 1.9 Comma-in-Square-Blocks Pattern
+
+Square blocks emit only their **last expression**. Earlier expressions execute for side-effects only:
+
+```
+[a = animal.selectOne, ""]                    // assigns a, outputs nothing
+[a = animal.selectOne, b = a.pastTense, c = a.futureTense]  // outputs c only
+[a = animal.selectOne, "blah blah blah"]      // outputs the literal string
+```
+
+This is the standard idiom for "run code without printing it". Functions don't need this trick — they hide all statements by default and only output what's after `return`.
+
+### 1.10 Function Syntax
+
+```
+calculateDamage() =>
+  d = dice.selectOne
+  if(n == "Sae") {
+    d = d * 2
+  } else if(n == "Jin" && d <= 2) {
+    d = d + 2
+  }
+  return d
+```
+
+- Arguments separated by commas: `getAnimals(num, joiner) => return animal.selectMany(num).joinItems(joiner)`
+- Async: `async doThing(a, b) => ... await ... return ...`
+- Treat the call site like any value: `[d = calculateDamage()]`, `[d > 5 ? "high" : "low"]`
+- **Indentation inside list-editor functions is stripped** (see 1.14 gotchas). HTML-panel `<script>` functions keep theirs.
+
+### 1.11 If/Else and Ternary
+
+Three forms — all equivalent. Pick whichever is least painful:
+
+```
+[if (n < 4) {sad} else {happy}]                  // long form
+[if (n < 4) sad ;else happy]                     // JS-style (note ;else)
+[n < 4 ? sad : happy]                            // ternary
+```
+
+**Critical rule: if/else must occupy its own square block.** This won't parse:
+
+```
+[n=num.selectOne, if(n==4) {"a"} else {"b"}]     // ❌ syntax error
+```
+
+Split it:
+
+```
+[n=num.selectOne, ""][if(n==4) {"a"} else {"b"}] // ✅
+```
+
+Inside the curly branches, refer to lists/variables **without** brackets, and quote literal text:
+
+```
+[if(c == "blue") {sad} else {happy}]   // ✅ — sad/happy are list refs, "blue" is literal
+[if([c] == blue) {[sad]} else {[happy]}] // ❌ — brackets around list refs, no quotes around literal
+```
+
+### 1.12 Inline Lists and Dynamic Odds
+
+Inline lists are anonymous one-liners using `{a|b|c}` or `{1-100}`:
+
+```
+eyeColor = {brown^3|blue|grey^0.2|green^0.3}    // static odds via ^
+score = {1-4}                                    // numeric range
+size = {{tiny|small}|{huge|massive}}             // nested
+```
+
+`^N` static odds: `^3` = 3× weight, `^0.2` = 1/5× weight. **Dynamic odds** wrap the weight in square brackets so it re-evaluates per selection:
+
+```
+adjective
+  not great ^[s == 1]      // only selectable when s==1
+  good      ^[s == 2]
+  great     ^[s > 2]
+```
+
+Combine with sub-list selection for "if/else by data":
+
+```
+shade
+  blue ^[c == "blue"]
+    cyan
+    navy blue
+  red ^[c == "red"]
+    maroon
+    cherry
+```
+
+### 1.13 `$preprocess` (Code Transformation Before Compilation)
+
+`$preprocess` is a function at the top of a generator that transforms the raw source text before Perchance parses it. Define it inline or import a community preprocessor:
+
+```
+// Inline — replace :smile: with 😊 everywhere:
+$preprocess(text) =>
+  text = text.replaceAll(":smile:", "😊");
+  return text;
+
+// Or import:
+$preprocess = {import:inline-dent-preprocessor}
+```
+
+To create a *shareable* preprocessor, make a generator whose top-level is `$output(text) => ... return text;`. Other people import it via `$preprocess = {import:your-preprocessor-name}`.
+
+Official + community preprocessors worth knowing:
+- `inline-dent-preprocessor` — official; lets you write properties inline
+- `inferno-shorthand-preprocessor-v1` — community shorthand syntax
+- `eatham-emoji-preprocessor-v1` — text → emoji substitution
+
+### 1.14 Page Load Order & Module Script Caveat
+
+Per-page execution sequence:
+1. HTML is added to the page (script tags **not yet** run).
+2. All `<script>` tags execute top-to-bottom.
+3. All square blocks in the HTML execute top-to-bottom, left-to-right within each line.
+
+Inside a single list, the same left-to-right rule applies — `[n] said "[say]"` will fail if `[say]` is what assigns `n`. Reorder so the variable is created before it's used.
+
+**`<script type="module">` exception:** module scripts have implicit `defer` and can use top-level `await`, so they run *after* DOM parsing but their relative order isn't guaranteed. Crucially, **inside a module script you cannot reference Perchance lists by bare name** — you must go through `root`:
+
+```html
+<script type="module">
+  // ❌ animal.selectOne   — undefined inside a module script
+  // ✅ root.animal.selectOne
+  let pick = root.animal.selectOne;
+</script>
+```
+
+### 1.15 Runtime Helpers: `update`, `createPerchanceTree`, error suppression
+
+```js
+update();                                  // re-evaluates all square blocks in HTML
+                                            // — does NOT clear variables or reset state
+let tree = createPerchanceTree("name\n\tbob");
+console.log(tree.name);                    // "bob"
+// Caveat: if your text uses {import:foo}, you must ALSO have {import:foo}
+// somewhere in the host generator so the data is preloaded.
+
+window.ignorePerchanceErrors(() => { /* code that might throw */ });
+window.clearPerchanceErrors();             // clear the in-page error log
+```
+
+### 1.16 Dynamic Page-State Mutation
+
+These work as expected from inside a generator (despite running in an iframe):
+
+```js
+document.title = "New title";
+window.location.hash = "#chapter-2";
+history.replaceState({}, "", `/${generatorName}?foo=123`);
+```
+
+You **cannot** change the URL pathname (the `generatorName` part) — that's blocked to prevent spoofing other generators.
+
+### 1.17 User-Side CSP
+
+Viewers can opt into Content Security Policy enforcement on any generator by appending `?$csp` to the URL. Useful when reviewing a fork before trusting it with credentials or external requests.
 
 ---
 
@@ -298,6 +584,270 @@ Character-level image controls (set on character object):
 - `imagePromptPrefix` — prepended to every image prompt
 - `imagePromptSuffix` — appended to every image prompt
 - `imagePromptTriggers` — `"keyword: description\nother: @prepend desc"` format
+
+---
+
+## 3.5 · Perchance HTTP API (server-side metadata + content fetching)
+
+Perchance exposes a small REST surface at `https://perchance.org/api/...` for fetching generator content, listings, screenshots, and dependency graphs. **All of these endpoints require `superFetch`** when called from a generator (browser CORS will block plain `fetch`). External apps (Discord bots, backends) can call them with normal `fetch`.
+
+### 3.5.1 The five toolkit endpoints
+
+```js
+// 1. Screenshot (returns image blob)
+const r1 = await superFetch(
+  `https://perchance.org/api/getGeneratorScreenshot?generatorName=${name}`
+);
+const imgUrl = URL.createObjectURL(await r1.blob());
+
+// 2. Recently edited generators (returns JSON {generators: [...]})
+const r2 = await superFetch(
+  'https://perchance.org/api/getGeneratorList?max=20&tags=cool,ai'
+);
+const { generators } = await r2.json();
+// Each generator: { name, views, lastEditTime, publicId, metaData: {title, description, image} }
+
+// 3. Stats (single or batch). Returns { status: 'success', data: {...} | [...] }
+const r3 = await superFetch(
+  'https://perchance.org/api/getGeneratorStats?name=animal'
+);
+const r3b = await superFetch(
+  'https://perchance.org/api/getGeneratorStats?names=animal,noun,adjective'
+);
+const { status, data } = await r3.json();
+
+// 4. Download generator source as HTML blob (or just the lists)
+const r4 = await superFetch(
+  `https://perchance.org/api/downloadGenerator?generatorName=${name}&listsOnly=true`
+);
+const html = await r4.blob(); // serve as a download
+
+// 5. Generators + their full dependency tree
+const r5 = await superFetch(
+  `https://perchance.org/api/getGeneratorsAndDependencies?generatorNames=${csv}`
+);
+const { generators: depMap, unfound } = await r5.json();
+// depMap: { 'animal': { imports: ['noun', 'adjective', ...] }, ... }
+```
+
+### 3.5.2 The public list endpoint (`generateList.php`)
+
+Separate from the toolkit above — this endpoint returns generated *output* from any public generator as a JSON array:
+
+```js
+// Returns ["lion", "tiger", "bear"] (or whatever the generator emits)
+const r = await fetch(
+  `https://perchance.org/api/generateList.php?generator=${name}&count=${n}`
+);
+const items = await r.json();
+```
+
+**External-app CORS note:** If you're calling this from a non-Perchance domain (Discord bot, your own site), you may hit CORS. Options: (a) use a CORS proxy, (b) call from a backend/server, (c) request CORS access for your domain from Perchance. Inside a Perchance generator, prefer `superFetch`.
+
+### 3.5.3 When to use which
+
+| Use case | Endpoint |
+|---|---|
+| Show "browse generators" UI | `getGeneratorList` |
+| Show stats card / preview thumbnail | `getGeneratorStats` + `getGeneratorScreenshot` |
+| Mirror/backup another generator's source | `downloadGenerator` |
+| Map a generator's import graph | `getGeneratorsAndDependencies` |
+| **Pull live output** for an app/bot | `generateList.php?generator=…&count=…` |
+
+`generateList.php` is the only one of these that actually *runs* the generator. The others read static metadata.
+
+### 3.5.4 Self-hosting / DIY API (Node.js + JSDOM)
+
+Perchance doesn't ship a server-side library, but you can run a generator under JSDOM by combining `downloadGenerator` with `__cacheBust`. The Glitch-hosted reference template is at `glitch.com/edit/#!/diy-perchance-api`:
+
+```js
+const { JSDOM } = require("jsdom");
+const fetch = require("node-fetch");
+
+const html = await fetch(
+  `https://perchance.org/api/downloadGenerator?generatorName=${name}&__cacheBust=${Math.random()}`
+).then(r => r.text());
+
+const { window } = new JSDOM(html, { runScripts: "dangerously" });
+
+console.log(window.root.output.toString());
+console.log(window.root.character.description.evaluateItem);
+
+// Mutate state then re-render:
+window.root.character.hitpoints = 10;
+window.update();
+```
+
+Notes:
+- The `__cacheBust=${Math.random()}` query param is the trick for bypassing the Cloudflare CDN cache when iterating during development.
+- First request to a generator is slow (cold cache); subsequent ones are fast.
+- For Discord bots specifically, use the dedicated template at `glitch.com/edit/#!/perchance-discord-server-bot-template`. Self-hosting via Node + pm2 also works (`pm2 start server.js`).
+
+### 3.5.5 ⚠ Critical: `ai-text-plugin` and `text-to-image-plugin` are origin-locked
+
+**These two plugins do NOT work on self-hosted servers, forks, or anything other than `perchance.org`.** They're funded by ads on perchance.org generators, and the AI servers gate requests by origin. If you (or a user) reports "ai-text-plugin doesn't work on my Glitch server / my fork / my downloaded HTML", this is why — there is no workaround other than running on perchance.org.
+
+Practical implications:
+- The DIY/self-hosted patterns in 3.5.4 work fine for **list-based** generators, but cannot drive the AI plugins.
+- A downloaded HTML file (via the Settings → Download button or the `download-button-plugin`) will run offline for list generation, but AI features will fail.
+- If a user wants their AI app to live on a custom domain, the workable shape is: host the *frontend* anywhere, but proxy AI calls back through a perchance.org-hosted generator they control.
+
+---
+
+## 3.6 · `secret-plugin` — Quantum-resistant client-side encryption
+
+Three-method API for end-to-end encrypted messaging. Keys are stable strings with magic envelopes you can pattern-match.
+
+```js
+// 1. Generate a keypair (no async — synchronous)
+const keys = secret.generateKeyPair();
+// keys.public  — string starting with "PUBLIC_"  ending "_PUBLIC_END"
+// keys.private — string starting with "PRIVATE_" ending "_PRIVATE_END"
+
+// 2. Encrypt with recipient's PUBLIC key
+const ciphertext = secret.encrypt(plaintext, recipientPublicKey);
+
+// 3. Decrypt with own PRIVATE key. Throws on failure — wrap in try/catch
+let plaintext;
+try {
+  plaintext = secret.decrypt(ciphertext, myPrivateKey);
+} catch (e) {
+  // wrong key, tampered ciphertext, or not actually a secret-plugin message
+}
+```
+
+### 3.6.1 Key validation helpers (recommended)
+
+```js
+const isPublicKey  = (s) => typeof s === 'string'
+  && s.startsWith('PUBLIC_')  && s.endsWith('_PUBLIC_END');
+const isPrivateKey = (s) => typeof s === 'string'
+  && s.startsWith('PRIVATE_') && s.endsWith('_PRIVATE_END');
+
+// Round-trip probe to verify a keypair matches before trusting it:
+function doesKeyPairMatch(publicKey, privateKey) {
+  if (!isPublicKey(publicKey) || !isPrivateKey(privateKey)) return false;
+  try {
+    const probe = `probe:${Date.now()}:${Math.random().toString(36).slice(2)}`;
+    return secret.decrypt(secret.encrypt(probe, publicKey), privateKey) === probe;
+  } catch { return false; }
+}
+```
+
+### 3.6.2 The canonical anonymous-messaging pattern
+
+Combine `secret-plugin` + `upload-plugin` + `comments-plugin` for a full anonymous-inbox app:
+
+```js
+// Profile owner generates keypair on first run, persists privateKey locally:
+const keys = secret.generateKeyPair();
+await idbSet('profile', { publicKey: keys.public, privateKey: keys.private });
+
+// Owner uploads only the PUBLIC key in profile JSON, gets a share URL:
+const { url } = await uploadPlugin(JSON.stringify({
+  publicKey: keys.public,
+  profile: { name, bio, avatarUrl },
+}));
+
+// Visitor fetches the profile, encrypts a message with the PUBLIC key,
+// posts it via comments-plugin to the profile's channel:
+const profile = await fetch(profileUrl).then(r => r.json());
+const encrypted = secret.encrypt(messageText, profile.publicKey);
+await commentsPlugin.submit(encrypted);
+
+// Owner reads comments and decrypts each with their PRIVATE key:
+for (const c of comments) {
+  try {
+    const plaintext = secret.decrypt(c.message.trim(), state.currentPrivateKey);
+    messages.push({ time: c.timestamp, text: plaintext });
+  } catch { /* skip — wrong key or non-secret message */ }
+}
+```
+
+**Key trust model:** the private key never leaves the owner's device. Anyone who gets the profile URL can *send* messages but not read them. The owner can additionally make a "reader-access link" by sharing the privateKey via another `uploadPlugin` upload — anyone with that link can read the inbox on their own device.
+
+### 3.6.3 Idioms
+
+- `secret.encrypt`/`secret.decrypt` are **synchronous**. No `await`.
+- Decrypt **always** wrapped in try/catch — comments from non-allowlisted senders will fail.
+- For inter-channel anonymity in `comments-plugin`, use the `+ids:channelName` channel suffix so user IDs are scoped per-channel (a user posting on two profile inboxes won't reveal they're the same person).
+
+---
+
+## 3.7 · `text-editor-plugin-v1` — Higher-performance textarea with styling
+
+Drop-in replacement for `<textarea>` backed by CodeMirror 6, with optional inline text styling (e.g. asterisks → italics, `**word**` → bold). Used when you need (a) better performance than a plain textarea on long inputs, (b) inline formatting without a full rich-text editor, or (c) features like collaborative cursors, syntax highlighting, or AI inline-completion.
+
+```js
+// In top-list:
+createTextEditor = {import:text-editor-plugin-v1}
+
+// In your custom code:
+const editor = createTextEditor({
+  parent: document.getElementById('writingArea'),
+  initialValue: 'Hello *world*',
+  placeholder: 'Type here…',
+  spellcheck: true,
+  darkMode: true,
+});
+
+// editor exposes:
+editor.value           // get/set as a string (cached for cheap reads)
+editor.dom             // the mount element
+editor.focus()
+editor.replaceSelection(text)
+editor.on('change', cb) // fired on doc edits
+```
+
+### 3.7.1 Underlying CodeMirror access
+
+The plugin re-exports CodeMirror 6 modules so you can extend the editor with full CM extensions:
+
+```js
+const cm = window.textEditorPluginMeta9973752983.codemirror6;
+const { CMView, CMState, CMCommands, oneDark, createInlineCopilotExtension, yCollab } = cm;
+
+// Add an extension after construction:
+editor.dispatch({ effects: CMState.StateEffect.appendConfig.of([oneDark]) });
+```
+
+### 3.7.2 Bundled extensions worth knowing
+
+- **`oneDark`** — the One Dark theme, ready to plug in
+- **`createInlineCopilotExtension(docId)`** — ghost-text AI completion. Wires up `window.copilotAutoCompleteFn[docId] = async (before, after) => string` which you implement using `aiTextPlugin`. Tab accepts the suggestion.
+- **`yCollab`** — Yjs collaborative editing (presence cursors + CRDT sync). Requires you bring your own Yjs provider (WebRTC, WebSocket, etc.) — Perchance doesn't ship one.
+
+### 3.7.3 When NOT to use it
+
+- For a single-line input, use `<input>`.
+- For a quick scratchpad, plain `<textarea>` is simpler and cheaper.
+- For full rich text (images inline, tables, links), use a dedicated editor like TipTap or ProseMirror.
+
+The sweet spot is **medium-to-long-form prose with light formatting** — story authoring, journal entries, character descriptions — where you want responsiveness on multi-thousand-word inputs and asterisk-italics rendering, but not a full CMS.
+
+---
+
+## 3.8 · Embedding & Distribution
+
+### 3.8.1 iframe embed
+
+Any public generator embeds via the `null.perchance.org` subdomain:
+
+```html
+<iframe src="https://null.perchance.org/my-generator-name"></iframe>
+```
+
+Size and styling are controlled by the embedder's CSS, not the generator.
+
+### 3.8.2 Single-file HTML download
+
+Settings → Download produces a self-contained HTML file with the generator inlined. The `download-button-plugin` lets you put a "Download" button directly in your generator so visitors can save it.
+
+**Editing a downloaded HTML file:** append `#edit` to the URL, press Enter, then refresh — the offline editor opens. This is the supported "what if perchance.org disappears" continuity story.
+
+### 3.8.3 Privacy / takedown
+
+Generators are public by default and forkable by anyone. Settings → "Make private" removes a generator from the public listing pages (e.g. `/generators`) but the URL itself remains accessible to anyone with the link.
 
 ---
 
@@ -1265,6 +1815,96 @@ This pattern generalizes beyond audio/visuals — any runtime side-effect the AI
 
 ---
 
+## 13.5 · Gotchas & Known Issues
+
+These are limitations of the Perchance engine itself — not bugs in any one app. They tend to bite in code review.
+
+### 13.5.1 HTML elements inside square blocks (HTML editor panel)
+
+The HTML panel renders innerHTML *first*, then evaluates square blocks in resulting text nodes. So this **breaks**:
+
+```html
+[p = "<p>hello</p>"]    <!-- ❌ HTML parser eats the brackets/tags first -->
+```
+
+Fixes:
+1. Move construction into the Perchance code panel (preferred), or
+2. Replace `<` with the JS unicode escape `\u003c`:
+
+```html
+[p = "\u003cp>hello\u003c/p>"]   <!-- ✅ -->
+```
+
+### 13.5.2 if/else needs its own square block
+
+Already covered in 1.11 — it's the single most common syntax error. `[n=num.selectOne, if(n==4) {"a"} else {"b"}]` won't parse. Always split: `[n=num.selectOne, ""][if(n==4) {"a"} else {"b"}]`.
+
+### 13.5.3 Inline lists re-evaluate on every access
+
+```
+foo = ["hello {1-100}"]
+console.log(foo)   // outputs "hello 87" (or "hello 12", or "hello 99"...)
+```
+
+Each access re-rolls the inline `{1-100}`. If you need the *raw* value, wrap it in a function:
+
+```
+foo() => return "hello {1-100}"
+console.log(foo())   // "hello {1-100}" — exactly as written
+```
+
+Square blocks **always** evaluate their contents before returning.
+
+### 13.5.4 `x = {[a]|[b]}` returns plain text, not list refs
+
+```
+x = {[a]|[b]}
+x.selectOne   // returns plain text from a or b — NOT a reference to the a/b list
+```
+
+If you want to randomly pick *which list* to draw from (preserving the list reference for `.pluralForm`, `.consumableList`, etc.), use `random-select-plugin` instead.
+
+### 13.5.5 Indentation stripped inside list-editor JS functions
+
+```
+// In the LISTS panel:
+myFunc() =>
+  if (x) {
+    doThing()    // indentation will be stripped at parse time
+  }
+```
+
+Indentation inside JS functions defined in the **list editor** is removed. Functions in the **HTML panel** `<script>` tags keep their indentation. If you need precise whitespace for a multi-line string or template, build it in a script tag.
+
+### 13.5.6 Backslash semantics
+
+Perchance's escape rules differ from most languages:
+- `\[` → `[` (literal bracket — correct as expected)
+- `\s` → space
+- `\o` → `\o` (the backslash is **kept** for non-escapable characters, unlike C/JS)
+- `\\` → `\` (this is how you produce a literal backslash)
+
+If your code runs inside a `<script>` tag vs. inside a square block, escape behavior may differ slightly. When in doubt, test both contexts.
+
+### 13.5.7 JS objects in square blocks need outer parens
+
+```
+[{foo: 1}]      // ❌ parsed as a labelled statement (ancient JS feature)
+[({foo: 1})]    // ✅ parens force expression-context
+```
+
+This is a JavaScript language wart, not a Perchance one — labelled statements look syntactically identical to object literals at statement position.
+
+### 13.5.8 `update()` doesn't reset state
+
+`update()` re-runs square blocks in the HTML, but **does not** clear variables, reset random seeds, or re-import generators. If you need a true fresh state (e.g., a "reroll" button that starts from scratch), reload the iframe / `location.reload()`.
+
+### 13.5.9 Module scripts can't access lists by bare name
+
+Already covered in 1.14: inside `<script type="module">`, write `root.animal.selectOne`, never `animal.selectOne`. Module scripts run with implicit `defer` and have a different scope chain.
+
+---
+
 ## 14 · Code Review Checklist (Perchance-specific)
 
 - [ ] All list functions use `async functionName() =>` syntax (not `function`)
@@ -1295,7 +1935,22 @@ This pattern generalizes beyond audio/visuals — any runtime side-effect the AI
 - [ ] iOS Safari `maximum-scale=1` viewport patch applied for touch devices
 - [ ] `tryPersistBrowserStorageData()` called once at end of page load
 - [ ] Mobile preload delayed: `if(window.innerWidth < 500) setTimeout(..., 5000)`
+- [ ] **`secret-plugin` decrypts always wrapped in try/catch** — non-allowlisted senders or wrong keys throw, not return null.
+- [ ] **`secret-plugin` keys validated by envelope** — `PUBLIC_…_PUBLIC_END` and `PRIVATE_…_PRIVATE_END` patterns. Reject obviously-malformed strings before decrypt.
+- [ ] **Private keys never leave the device** — uploaded profiles ship `keys.public` only. Reader-access links are an opt-in second upload, never automatic.
+- [ ] **Perchance HTTP API calls use `superFetch`** inside generators — plain `fetch` will be CORS-blocked. External apps (Discord bots, backends) use plain `fetch` and may need a CORS proxy.
+- [ ] **Don't confuse `generateList.php` with the toolkit endpoints** — only `generateList.php` actually *runs* a generator. The five toolkit endpoints (`getGenerator*`, `downloadGenerator`) read static metadata.
+- [ ] **`text-editor-plugin-v1` extensions added via `dispatch({ effects: appendConfig.of(...) })`**, not by re-creating the editor.
 - [ ] `$meta.dynamic` `urlNamedCharacters` comment reminder: `// NOTE: must add named chars to $meta.dynamic too`
+- [ ] **if/else lives in its own square block** — `[n=x.selectOne, ""][if(n==4) {"a"} else {"b"}]`, never combined.
+- [ ] **Module scripts use `root.<list>`** — bare names don't resolve inside `<script type="module">`.
+- [ ] **Inline-list raw values use functions, not `=`** — `foo() => return "{1-100}"` for the unevaluated form; `foo = ["{1-100}"]` re-rolls on every access.
+- [ ] **Don't promise AI plugins on self-hosted/forked deployments** — `ai-text-plugin` and `text-to-image-plugin` are origin-locked to perchance.org. Recommend the proxy-via-perchance pattern instead.
+- [ ] **HTML elements in HTML-panel square blocks need `\u003c`** — innerHTML parses before square blocks evaluate. Or move construction to the Perchance code panel.
+- [ ] **JS objects in square blocks wrap with parens** — `[({foo:1})]`, never `[{foo:1}]` (avoids the labelled-statement trap).
+- [ ] **`update()` is NOT a state reset** — it re-runs square blocks, but variables, randomness, and imports persist. Use `location.reload()` for a true reset.
+- [ ] **Variables created in a list are visible only after their creation point** — left-to-right, top-to-bottom. `[n] said "[say]"` fails if `[say]` is what assigns `n`.
+- [ ] **`evaluateItem` used when storing values that contain inline lists** — `[f = fruit.selectOne.evaluateItem]` to lock in a specific evaluation, otherwise `[f]` re-evaluates each access.
 
 ---
 
