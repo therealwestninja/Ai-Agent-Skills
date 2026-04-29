@@ -5,10 +5,15 @@ description: >
   or any JavaScript code that runs on perchance.org. Covers the Perchance DSL syntax, the ai-text-plugin
   API, text-to-image plugin, character/thread/message data models, IndexedDB (Dexie.js) patterns,
   hierarchical summarization, lorebooks, memory systems, streaming responses, sandboxed custom code,
-  and share-link/upload patterns. Trigger this skill for any mention of perchance, ai-text-plugin,
-  perchance generator, ai-character-chat, or building a Perchance-hosted AI app. Also trigger when
-  the user shows code that uses `root.aiTextPlugin`, `root.textToImagePlugin`, Perchance list syntax,
-  or the `{import:...}` pattern.
+  share-link/upload patterns including the hash-share fallback for forked deployments,
+  upload-plugin domain-allowlist mitigation, the `expires`+`deletionUrl` upload options,
+  AI runtime sentinels for letting the AI drive scene/runtime side-effects, and natural-language
+  wizard skips. Trigger this skill for any mention of perchance, ai-text-plugin, perchance generator,
+  ai-character-chat, or building a Perchance-hosted AI app. Also trigger when the user shows code
+  that uses `root.aiTextPlugin`, `root.textToImagePlugin`, `root.uploadPlugin`, Perchance list syntax,
+  the `{import:...}` pattern, `[BG:type]` / `[VIZ:type]` / `[PAUSE n]` markers, or hash-share URLs
+  like `#cfg=` / `#persona=`. Trigger when seeing the upload error
+  "Forbidden: This API Key is locked to specific domains".
 ---
 
 # Perchance API & AI Chat Skill
@@ -596,6 +601,195 @@ at thread start:
 
 ## 8 · File Hosting & Share Links
 
+The Perchance ecosystem offers two complementary share mechanisms. **Use both in cascade**: hash-share first (no server roundtrip, never expires, works on forks), upload-share when the payload is too large for a URL fragment, clipboard-JSON as a final fallback. The cascade matters because of a server-side restriction described below.
+
+### 8.1 The domain-allowlist constraint (READ THIS FIRST)
+
+The `upload-plugin` posts `window.generatorName` to `https://upload.perchance.org` as part of every upload request. The upload server's API key is **locked to specific generator slugs at the server side**. Forks and hex-named subdomains (e.g. `64116dfabfc9f6706198dbf7f23c4240.perchance.org`, the slug of an unsaved fork) are rejected with:
+
+```
+Forbidden: This API Key is locked to specific domains.
+Current origin: https://<slug>.perchance.org.
+Ensure your generator name is added to the allowed list.
+```
+
+**This is server-side. You cannot bypass it from the client.** Overriding `window.generatorName` would circumvent Perchance's security model — don't. The right mitigation is to design your share path so it doesn't require the upload server in the first place. That's what the hash-share pattern below does.
+
+The audit-server-side fix (allowlisting your fork slug) requires intervention from Perchance's maintainers.
+
+### 8.2 The three URL shapes
+
+| Shape | Mechanism | Persistence | Works on forks? | Use when |
+|---|---|---|---|---|
+| `?data=<fileId>.gz` | `upload-plugin` → `user.uploads.dev` CDN | 30 days (default) – permanent | ❌ no (allowlist) | payload doesn't fit in URL fragment |
+| `#cfg=<params>` (legacy) | URL fragment, key-value | permanent — URL is the data | ✅ yes | small structured config (preset references) |
+| `#kind=<gzip-base64>` | URL fragment, opaque encoded blob | permanent — URL is the data | ✅ yes | any JSON ≤ ~3 KB after gzip |
+
+The hash-share `#kind=<…>` is the most general. Use it as your default. Fall back to upload only when the payload exceeds the URL budget.
+
+### 8.3 Hash-share helpers (recommended default)
+
+```js
+const HASH_SHARE_URL_BUDGET = 1900; // chars total — leaves headroom for clients that strip whitespace or add prefixes (Discord, Slack)
+
+async function buildHashShareUrl(payload, kind) {
+  try {
+    const json = JSON.stringify(payload);
+    // Gzip compress
+    const stream = new Blob([json]).stream().pipeThrough(new CompressionStream('gzip'));
+    const compressed = await new Response(stream).arrayBuffer();
+    // URL-safe base64 (+ → -, / → _, no padding)
+    const bytes = new Uint8Array(compressed);
+    let bin = '';
+    for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    const b64 = btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    const base = window.location.origin + window.location.pathname;
+    const url = `${base}#${kind}=${b64}`;
+    if (url.length > HASH_SHARE_URL_BUDGET) return null; // too large; caller falls through to upload
+    return url;
+  } catch { return null; }
+}
+
+async function decodeHashShareFragment(b64) {
+  try {
+    let std = b64.replace(/-/g, '+').replace(/_/g, '/');
+    while (std.length % 4) std += '=';
+    const bin = atob(std);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
+    const json = await new Response(stream).text();
+    return JSON.parse(json);
+  } catch { return null; }
+}
+```
+
+**Budget math:** origin + pathname is typically 60-100 chars. Gzip compresses JSON 50-70%; base64 expands by 33%. Net: JSON payloads up to ~3 KB after gzip fit comfortably in 1900 chars.
+
+### 8.4 Upload-plugin: `expires` for quota boost
+
+The `upload-plugin` accepts an `expires` (epoch ms) option. Per its docs:
+
+| `expires` | Quota boost |
+|---|---|
+| ≤ 24 hours | **400×** |
+| 30 days | ~50-100× (interpolated) |
+| 1 year | **20×** |
+| omitted (permanent) | 1× (baseline) |
+
+For temporary-style shares (the common case — a friend opens the link within hours/days), pass `expires: Date.now() + 30 * 86400 * 1000`. You get a meaningful quota boost in exchange for a 30-day expiry that almost no realistic share lifecycle hits.
+
+```js
+const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
+const result = await uploadPlugin(file, { expires: Date.now() + THIRTY_DAYS_MS });
+```
+
+### 8.5 Upload-plugin: `deletionUrl` capture
+
+The upload-plugin response includes a `deletionUrl` that's valid for **3 days** after upload. After that, the deletion endpoint expires.
+
+```js
+const { url, size, error, deletionUrl } = await uploadPlugin(file, opts);
+// Persist deletionUrl + createdAt in IDB so the user can revoke later:
+await idbSet('shared_links', [...existing, {
+  id: 'sh_' + Date.now().toString(36),
+  url, deletionUrl,
+  createdAt: Date.now(),
+  expiresAt: opts.expires || null,
+}]);
+
+// To revoke later (within 3-day window):
+const res = await fetch(deletionUrl).then(r => r.json());
+// res.success will be true if deletion succeeded. Mark revoked locally
+// regardless — server may cache, and re-trying is wasteful.
+```
+
+### 8.6 The three-tier cascade pattern
+
+For any share-link feature, structure your code as:
+
+```js
+async function shareThing(payload, opts = {}) {
+  // Tier 1 — hash-share (no server, permanent, works on forks)
+  const hashUrl = await buildHashShareUrl(payload, opts.kind || 'data');
+  if (hashUrl) {
+    showShareModal(hashUrl);
+    return;
+  }
+  // Tier 2 — upload-share (might 403 on forks; 30-day expiry by default)
+  const uploadUrl = await createShareUpload(payload, {
+    fileName: opts.kind || 'share',
+    expires: Date.now() + THIRTY_DAYS_MS,
+  });
+  if (uploadUrl) {
+    showShareModal(uploadUrl);
+    return;
+  }
+  // Tier 3 — clipboard JSON (always works, manual paste)
+  const accepted = await confirmAsync(
+    'Couldn\'t create a share link. Copy the JSON to your clipboard so you can send it directly?'
+  );
+  if (accepted) await copyJsonToClipboard(payload);
+}
+```
+
+**The cascade matters because hash-share NEVER fails on size-fit payloads.** The upload server is the unreliable component (allowlist + quotas + content moderation). Only hit it when you must.
+
+### 8.7 Modal copy: distinguish the URL shapes
+
+Users need to know whether a link will expire. Detect the URL shape and render an appropriate footer note:
+
+```js
+const isUploadShare = /\?data=/.test(url);
+const isHashShare   = /#\w+=/.test(url);
+let footerNote = '';
+if (isUploadShare) {
+  footerNote = 'Note: Upload-based share links expire after 30 days. ' +
+    'For permanent sharing, send a hash-share link or use cloud upload.';
+} else if (isHashShare) {
+  footerNote = 'Permanent: The data is encoded in the link itself, ' +
+    'so it never expires and works on any deployment — no upload server needed.';
+}
+```
+
+### 8.8 `$meta.dynamic` link previews for hash-shares
+
+`$meta.dynamic` runs in a sandboxed context with no network access, so it can't decompress the hash-share payload to extract a title. Use a generic preview based on the `kind` in the URL fragment:
+
+```js
+$meta.dynamic
+  $output(params, hash) =>
+    if (hash.indexOf("persona=") === 0) {
+      return {
+        title: "Shared Custom Guide (Persona)",
+        description: "Someone shared a custom guide with you. " +
+          "Open to review it and add it to your library.",
+        image: defaultImage,
+      };
+    }
+    if (hash.indexOf("cfg=") === 0) {
+      // Legacy human-readable form — can parse fields directly:
+      let qs = new URLSearchParams(hash.slice(4));
+      return {
+        title: "Shared session: " + (qs.get("m") || "custom"),
+        description: "...",
+        image: defaultImage,
+      };
+    }
+    if (params.data) {
+      // Upload-share — opaque from here too
+      return {
+        title: "Shared content",
+        description: "...",
+        image: defaultImage,
+      };
+    }
+```
+
+### 8.9 Legacy upload-only example (for reference)
+
+The original ai-character-chat pattern, kept for reference. Use the cascade above instead unless you specifically need this legacy shape:
+
 ```js
 // Upload a Blob to Perchance CDN:
 let { url, size, error } = await uploadPlugin(blob);
@@ -611,64 +805,7 @@ if(error) {
   return;
 }
 
-// Share link format:
-// https://perchance.org/<generator-name>?data=<CharName>~<filename>.gz
-
-// Full share link generation:
-async function generateShareLink(json) {
-  if(!window.CompressionStream) {
-    alert("Share links require a modern browser. Please upgrade or switch from Safari to Chrome.");
-    return;
-  }
-  let loadingModal = createLoadingModal("⏳ Generating share link...");
-
-  // Also build a hash-based URL (for debugging):
-  let urlHashData = encodeURIComponent(JSON.stringify(json))
-    .replace(/[!'()*]/g, c => '%' + c.charCodeAt(0).toString(16));
-  console.log("shareUrl (hash version):", `https://perchance.org/${window.generatorName}#${urlHashData}`);
-
-  // Convert to blob, compress, upload:
-  let jsonString = JSON.stringify(json);
-  let blob = await fetch("data:text/plain;charset=utf-8," + jsonString.replace(/#/g, "%23"))
-    .then(r => r.blob());
-  let compressed = await compressBlobWithGzip(blob);
-  let { url, error } = await uploadPlugin(compressed);
-  loadingModal.delete();
-  if(error) { /* handle error */ return; }
-
-  let fileName = url.replace("https://user.uploads.dev/file/", "");
-  // Character name in URL is cosmetic only — sanitize but doesn't affect data:
-  let charName = json.addCharacter.name.replace(/\s+/g, "_").replaceAll("~", "");
-  return `https://perchance.org/${window.generatorName}?data=${charName}~${fileName}`;
-}
-
-// Loading from a share link URL:
-async function loadDataFromShareUrl() {
-  let searchParams = new URL(window.location.href).searchParams;
-  let dataParam = searchParams.get("data");
-  if(!dataParam && searchParams.get("char")) {
-    // Named characters: ?char=ai-adventure → look up gz filename from urlNamedCharacters list
-    dataParam = "foo~" + urlNamedCharacters[searchParams.get("char")];
-  }
-  let fileName = dataParam.split("~").slice(-1)[0];
-  let fileUrl = "https://user.uploads.dev/file/" + fileName;
-
-  let blob = await fetch(fileUrl, {
-    signal: AbortSignal.timeout ? AbortSignal.timeout(15000) : null
-  }).then(r => r.ok ? r.blob() : null).catch(console.error);
-
-  if(!blob) {
-    await confirmAsync(
-      "File not found. Check if it has been quarantined:\nperchance.org/quarantined-files",
-      { hideCancel: true }
-    );
-    return null;
-  }
-  let decompressed = await decompressBlobWithGzip(blob);
-  return JSON.parse(await decompressed.text());
-}
-
-// Compression helpers:
+// Compression helpers (for upload payload):
 async function compressBlobWithGzip(blob) {
   const cs = new CompressionStream("gzip");
   let out = await new Response(blob.stream().pipeThrough(cs)).blob();
@@ -678,7 +815,45 @@ async function decompressBlobWithGzip(blob) {
   const ds = new DecompressionStream("gzip");
   return await new Response(blob.stream().pipeThrough(ds)).blob();
 }
+
+// Loading a `?data=…` upload-share:
+async function loadDataFromShareUrl() {
+  let dataParam = new URL(window.location.href).searchParams.get("data");
+  if (!dataParam) return null;
+  let fileName = dataParam.split("~").slice(-1)[0]; // strip cosmetic prefix
+  let blob = await fetch("https://user.uploads.dev/file/" + fileName, {
+    signal: AbortSignal.timeout?.(15000)
+  }).then(r => r.ok ? r.blob() : null).catch(console.error);
+  if (!blob) {
+    // File may have been quarantined: perchance.org/quarantined-files
+    return null;
+  }
+  let decompressed = await decompressBlobWithGzip(blob);
+  return JSON.parse(await decompressed.text());
+}
 ```
+
+### 8.10 Upload-plugin error handling — observed taxonomy
+
+```js
+} catch (e) {
+  const msg = String(e?.message || e);
+  if (/locked to specific domains/i.test(msg) || /Forbidden/i.test(msg)) {
+    // Fork / non-allowlisted deployment — fall through to hash-share
+    // or clipboard. Do NOT retry.
+  } else if (msg.includes('disallowed_content')) {
+    // Content moderation — surface the under-18 clarification message.
+  } else if (/over_daily_allowance|file_too_big|invalid_filetype/.test(msg)) {
+    // Quota / shape errors — surface to user.
+  } else {
+    // Unknown — log and surface generic message.
+  }
+}
+```
+
+### 8.11 What window.generatorName is and isn't
+
+`window.generatorName` is set by Perchance's generator-loading infrastructure. It identifies which generator slug is running. The upload server reads this to enforce the API-key allowlist. **It is not a security primitive that you should override.** Lying about it would (a) defeat the allowlist, (b) violate Perchance's terms, (c) likely break in production when the upload server adds origin verification.
 
 ---
 
@@ -918,6 +1093,64 @@ await exportRawDb(window.dbName, {
 
 ## 13 · Common Patterns
 
+### Natural-language wizard skip ("SmartAssist")
+
+Multi-step wizards are friction. Let the user describe what they want in plain English; have the AI return structured JSON; dispatch each field as if the user had filled it in. Pattern:
+
+```js
+async function runSmartAssist(userCommand) {
+  const instruction = buildSmartAssistPrompt(userCommand);
+  // CRITICAL — `startWith: '{'` strips the opening brace from the response.
+  // CRITICAL — include the chat-format-bleed safety net stops EVEN for direct
+  //            aiTextPlugin calls (the aiGenerate wrapper auto-merges them,
+  //            but direct callers must add manually).
+  const data = await root.aiTextPlugin({
+    instruction,
+    startWith: '{',
+    stopSequences: ['\n\n\n', '\n\n}\n', '```', '\n\n[[', '\n[['],
+    hideStartWith: true,
+  });
+  if (!data || data.stopReason === 'error') throw new Error('AI returned an error.');
+  let text = (data.generatedText || '').trim();
+  if (!text) throw new Error('AI returned empty output.');
+  // Re-attach the stripped opening brace + scan for matching close to defend
+  // against trailing chatter:
+  if (!text.startsWith('{')) text = '{' + text;
+  const lb = text.lastIndexOf('}');
+  if (lb > -1) text = text.substring(0, lb + 1);
+  const cfg = JSON.parse(text);
+  // Dispatch each field as if the user had picked it manually — fire `change`
+  // events on the corresponding inputs/selects so the rest of the app's
+  // wiring catches up.
+  applySmartAssistConfig(cfg);
+}
+```
+
+**Build the prompt by enumerating valid options inline** so the AI returns values that map cleanly:
+
+```js
+function buildSmartAssistPrompt(userCommand) {
+  return `User wants: "${userCommand}"
+
+Return a JSON object choosing values from these options:
+
+PERSONAS (pick ONE id): ${PERSONAS.map(p => `"${p.id}" (${p.tagline})`).join(', ')}
+METHODS (pick ONE id): ${METHODS.map(m => `"${m.id}" (${m.tagline})`).join(', ')}
+INTENTIONS: ${Object.keys(INTENTION_TYPES).join(', ')}
+LENGTHS: ${Object.keys(PHASE_DURATIONS).join(', ')}
+SOUNDSCAPES: ${SOUNDSCAPES.join(', ')}
+
+Return ONLY a JSON object like:
+{"persona": "id", "method": "id", "intention": "type", "length": "size",
+ "soundscape": "name", "intentionInput": "user-paraphrased intent"}
+
+If a field is unclear from the request, omit it (don't guess). Keep
+"intentionInput" to ≤120 characters.`;
+}
+```
+
+**UI:** chat-style composer (textarea + accent-bordered send button on the right) so users recognize it as a chat input, not another form field. Plain Enter submits; Shift+Enter inserts a newline (chat convention).
+
 ### Conditional image generation (chat messages)
 ```js
 const imageKeywords = /\b(images?|pics?|photos?|selfie|draw|paint|generate)\b/i;
@@ -975,6 +1208,61 @@ async function tryPersistBrowserStorageData() {
 // createFloatingWindow({ header, body, initialWidth, initialHeight }) → element
 ```
 
+### AI runtime sentinels — letting the AI direct the runtime
+
+Sometimes you want the AI to drive the runtime, not just emit text. Example: in a hypnosis app, when the AI writes "let the rain wash through your shoulders", the soundscape *should* be rain at that moment. Hardcoding rain in the wizard is wrong (the user picked something else); ignoring the language is also wrong (jarring mismatch).
+
+**Pattern:** let the AI emit bracketed directives in its output that get parsed before display, dispatched to the runtime, and stripped from text. Same shape as `[PAUSE n]` markers but for any side-effect:
+
+```js
+// Strict allowlist — the AI cannot drive the runtime into invalid states
+const VALID_BG_VALUES = new Set(['rain', 'ocean', 'fire', /* … */]);
+const VALID_VIZ_VALUES = new Set(['spiral', 'tunnel', 'aurora', /* … */]);
+
+function extractSceneSentinels(text) {
+  const dispatches = [];
+  const stripped = text.replace(/\[(BG|VIZ):\s*([\w\-]+)\s*\]/gi, (_, kind, value) => {
+    const k = kind.toUpperCase();
+    const v = String(value || '').toLowerCase().trim();
+    if (k === 'BG' && VALID_BG_VALUES.has(v))   dispatches.push({ kind: 'bg', value: v });
+    if (k === 'VIZ' && VALID_VIZ_VALUES.has(v)) dispatches.push({ kind: 'viz', value: v });
+    return ''; // ALWAYS strip from text — never leak into TTS
+  });
+  return { stripped, dispatches };
+}
+
+function dispatchSceneSentinels(dispatches) {
+  let delay = 0;
+  for (const d of dispatches) {
+    setTimeout(() => switchSceneLive(d.kind, d.value), delay);
+    delay += 800; // gap so audio engine doesn't churn
+  }
+}
+```
+
+**Five non-obvious rules:**
+
+1. **Always strip, even when disabled.** A "disable AI scene directives" toggle should disable the *dispatch*, not the strip. Sentinels must never leak into TTS as "open bracket BG colon rain close bracket".
+2. **Strict allowlist, silent drop.** AI output is non-deterministic. `[BG:waterfall]` — drop it silently. Don't throw; don't log noisily.
+3. **Inter-dispatch gap.** Audio/visual engines take time to start/stop. Stacked directives like `[BG:rain][VIZ:waveform][BG:ocean]` need ~800ms between dispatches so engines don't fight each other.
+4. **Fire and forget.** The dispatch is a side-effect on the runtime; don't `await` it inside the speech path. Speech should not block on engine churn.
+5. **Prompt the AI sparingly.** Add the sentinel primer to your shared context as a *low-priority* block (e.g. priority 2 in your token-budget hierarchy) so it trims out under tight context. List the valid values explicitly, instruct "use sparingly, prefer at phase start, skip when current scene already fits".
+
+**Hooking in:** put the extraction BEFORE your generic bracket-strip pass. The order matters because the generic strip would erase your sentinels if it ran first.
+
+```js
+// In speakScript or equivalent text-to-speech handler:
+canonical = canonical.replace(/\[\[(.+?)\]\]/g, '\u0001$1\u0002'); // protect [[ ]] markers
+const ext = extractSceneSentinels(canonical);
+canonical = ext.stripped;
+if (state.aiSceneDirectivesEnabled !== false) dispatchSceneSentinels(ext.dispatches);
+canonical = canonical.replace(/\[[^\]]+\]/g, m =>
+  /^\[PAUSE\s+\d+\]$/i.test(m) ? m : ''
+); // generic strip — preserves PAUSE, erases everything else
+```
+
+This pattern generalizes beyond audio/visuals — any runtime side-effect the AI could meaningfully direct (camera angles in a 3D app, lighting in a scene generator, character moods in an RPG) fits the same shape.
+
 ---
 
 ## 14 · Code Review Checklist (Perchance-specific)
@@ -983,13 +1271,21 @@ async function tryPersistBrowserStorageData() {
 - [ ] `$meta.dynamic` is fully self-contained (no `root.*` refs)
 - [ ] `urlNamedCharacters` map **duplicated** inside `$meta.dynamic` — cannot use `root.*` there
 - [ ] `stopSequences` always includes `"\n\n[["` for chat completions
+- [ ] **Direct `root.aiTextPlugin` callers ALSO include `"\n[["`** — chat-format-bleed shows up with single newline too. The `aiGenerate` wrapper auto-merges both; direct callers must add manually.
 - [ ] `hideStartWith: true` set when using `startWith` to avoid double-printing
+- [ ] **`startWith: '{'` callers re-attach the brace + scan for matching `}` to defend against trailing chatter** — the option strips the opening brace from the response
 - [ ] CORS-sensitive fetches in custom code use `superFetch`
 - [ ] Token budget: `idealMaxContextTokens - 800` buffer to protect prefix cache
 - [ ] `countTokens(text) > idealMaxContextTokens * 0.3` guard on role instructions
 - [ ] `window.textEmbedderFunction` checked before calling `embedTexts()`
 - [ ] `embedTexts()` called with `{ textArr, modelName }` object signature (not bare array)
 - [ ] Share link JSON strips private user data (`id`, `lastMessageTime`, etc.)
+- [ ] **Share path uses the three-tier cascade** — hash-share → upload → clipboard JSON. Hash-share is preferred (no server roundtrip, never expires, works on forks).
+- [ ] **Upload calls pass `expires`** — 30 days default for ~50-100× quota boost. Permanent retention is rarely worth the quota tax.
+- [ ] **`deletionUrl` from upload response is captured + persisted** — IDB ring buffer per-share with 3-day revoke window. Don't strand it in console logs.
+- [ ] **Upload errors are matched specifically** — `/locked to specific domains/i` (allowlist), `disallowed_content` (moderation), `over_daily_allowance|file_too_big|invalid_filetype` (quota/shape). Each gets a different user-facing message.
+- [ ] **DON'T override `window.generatorName`** to bypass the upload-plugin allowlist. Use hash-share fallback instead.
+- [ ] `$meta.dynamic` covers all share URL shapes — `?data=…`, `#cfg=…`, `#kind=…` — with appropriate generic previews when the payload is opaque.
 - [ ] Sandbox origin check: `event.origin === 'https://7deabe31ae18ea5ed27c5f71b9633999.perchance.org'`
 - [ ] `data.stopReason === "error"` handled before using `data.generatedText`
 - [ ] Summary injection batched (`summariesReadyToInject.length >= 3` before DB write)
