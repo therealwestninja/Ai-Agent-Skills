@@ -1,5 +1,0 @@
-font = {import:font-plugin}
-noun = {import:noun} 
-
-output
-	[noun.selectMany(30).joinItems(" ")]

@@ -1,1 +1,0 @@
-$output = [window.cachedUrlParams8578473 ? window.cachedUrlParams8578473 : window.cachedUrlParams8578473=Object.fromEntries([...new URL(window.location.href).searchParams.entries()])]
